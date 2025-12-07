@@ -744,7 +744,7 @@ export default function FloorPlanMeasurementApp() {
       : "default";
 
   return (
-    <div className="w-full h-full min-h-[560px] flex flex-col text-slate-900 bg-linear-to-br from-slate-50 via-slate-50 to-slate-100">
+    <div className="w-full h-dvh max-h-dvh flex flex-col overflow-hidden text-slate-900 bg-linear-to-br from-slate-50 via-slate-50 to-slate-100">
       {/* Toolbar */}
       <div className="flex flex-wrap items-center gap-2 p-3 border-b border-slate-200 bg-white/90 backdrop-blur supports-backdrop-filter:bg-white/70 shadow-sm">
         <label className="inline-flex items-center gap-2 px-3 py-2 rounded-xl border hover:bg-slate-50 cursor-pointer border-slate-200 bg-white shadow-sm">
@@ -898,7 +898,7 @@ export default function FloorPlanMeasurementApp() {
         ref={containerRef}
         onDrop={handleDrop}
         onDragOver={(e) => e.preventDefault()}
-        className="relative flex-1 bg-[#eef2f9] overflow-hidden"
+        className="relative flex-1 min-h-0 bg-[#eef2f9] overflow-hidden"
         style={{ overscrollBehavior: "contain" }}
       >
         {!hasImage && (
