@@ -613,16 +613,12 @@ export default function FloorPlanMeasurementApp() {
     ctx.save();
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.clearRect(0, 0, canvas.width, canvas.height);
-    ctx.scale(dpr, dpr);
+    ctx.fillStyle = "#f8fafc";
+    ctx.fillRect(0, 0, canvas.width, canvas.height); // keep canvas background consistent even when zoomed out
+
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.translate(offsetRef.current.x, offsetRef.current.y);
     ctx.scale(zoomRef.current, zoomRef.current);
-    ctx.fillStyle = "#f8fafc";
-    ctx.fillRect(
-      -offsetRef.current.x / zoomRef.current - 10000,
-      -offsetRef.current.y / zoomRef.current - 10000,
-      20000,
-      20000
-    );
     if (img) {
       ctx.imageSmoothingQuality = "high";
       ctx.drawImage(img, 0, 0);
