@@ -1,952 +1,277 @@
 import type React from "react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { GlobalWorkerOptions, getDocument, type PDFPageProxy, type RenderTask } from "pdfjs-dist";
+import pdfWorker from "pdfjs-dist/build/pdf.worker.min.mjs?url";
+import { closedFaces, distance, edgeLength, orthogonalPoint, type Point } from "./geometry";
+import { useFloorplanStore, type Document, type Tool, type Units } from "./store";
 
-// Floor Plan Measurement App
-// Upload a floor plan image, calibrate with the scale bar, then measure.
-// Trackpad-friendly controls and localStorage persistence.
+const LS_KEY = "floorplan-measurement-v9";
+const HIT_RADIUS = 10;
+const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
+type View = { zoom: number; offset: { x: number; y: number } };
+type ImageInfo = { dataUrl: string; name: string; width: number; height: number };
+type BackgroundInfo = ImageInfo & { kind?: "image" | "pdf" };
 
-// ---------------------------------
-// Helpers placed first to avoid hoist quirks
-// ---------------------------------
-function clamp(v: number, min: number, max: number) {
-  return Math.min(max, Math.max(min, v));
-}
+GlobalWorkerOptions.workerSrc = pdfWorker;
 
-// Types
-type Line = { id: string; x1: number; y1: number; x2: number; y2: number };
-type Mode = "calibrate" | "measure";
-type Units = "m" | "cm" | "mm";
-type SavedState = {
-  img?: { dataUrl: string; name?: string; w: number; h: number };
-  ppm: number | null; // pixels per meter
-  refLength: number; // meters
-  units: Units;
-  lines: Line[];
-  calLine: Line | null;
-  zoom: number;
-  offset: { x: number; y: number };
-};
-
-const LS_KEY = "fp-measurement-state-v8";
-
-export default function FloorPlanMeasurementApp() {
-  // Elements
-  const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const containerRef = useRef<HTMLDivElement | null>(null);
-  const imgRef = useRef<HTMLImageElement | null>(null);
-
-  // Image state
-  const [imgInfo, setImgInfo] = useState<{
-    w: number;
-    h: number;
-    name?: string;
-  } | null>(null);
-  const [imgDataUrl, setImgDataUrl] = useState<string | null>(null);
-  const [hasImage, setHasImage] = useState(false);
-
-  // View transform
-  const [zoom, setZoom] = useState(1);
-  const [offset, setOffset] = useState({ x: 0, y: 0 });
-  const zoomRef = useRef(zoom);
-  useEffect(() => {
-    zoomRef.current = zoom;
-  }, [zoom]);
-  const offsetRef = useRef(offset);
-  useEffect(() => {
-    offsetRef.current = offset;
-  }, [offset]);
-
-  // Modes and interactions
-  const [mode, setMode] = useState<Mode>("calibrate"); // start in calibrate
-  const [isDragging, setIsDragging] = useState(false);
-  const [isPanning, setIsPanning] = useState(false);
-  const [dragStartWorld, setDragStartWorld] = useState<{
-    x: number;
-    y: number;
-  } | null>(null);
-  const [tempLine, setTempLine] = useState<Line | null>(null);
-  const [panStart, setPanStart] = useState<{
-    x: number;
-    y: number;
-    ox: number;
-    oy: number;
-  } | null>(null);
-  const [shiftDown, setShiftDown] = useState(false);
+export default function App() {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const pdfCanvasRef = useRef<HTMLCanvasElement>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const pdfPageRef = useRef<PDFPageProxy | null>(null);
+  const pdfRenderRef = useRef<RenderTask | null>(null);
+  const pdfRenderTimerRef = useRef<number | null>(null);
+  const renderedPdfViewRef = useRef<View | null>(null);
+  const [imageInfo, setImageInfo] = useState<BackgroundInfo | null>(null);
+  const [pdfRevision, setPdfRevision] = useState(0);
+  const [fileError, setFileError] = useState<string | null>(null);
+  const [isLoadingFile, setIsLoadingFile] = useState(false);
+  const [hydrated, setHydrated] = useState(false);
+  const [view, setView] = useState<View>({ zoom: 1, offset: { x: 0, y: 0 } });
+  const viewRef = useRef(view);
+  const [pointerWorld, setPointerWorld] = useState<Point | null>(null);
+  const [hoveredPointId, setHoveredPointId] = useState<string | null>(null);
+  const [hoveredSegment, setHoveredSegment] = useState<string | null>(null);
+  const [calibrationStart, setCalibrationStart] = useState<Point | null>(null);
   const [spaceDown, setSpaceDown] = useState(false);
+  const interaction = useRef<null | {
+    kind: "pan" | "point"; pointerId: number; startScreen: { x: number; y: number };
+    startOffset?: { x: number; y: number }; pointId?: string; startPoint?: Point;
+    currentPoint?: Point; moved: boolean; inserted?: boolean;
+  }>(null);
+  const touches = useRef(new Map<number, { x: number; y: number }>());
+  const pinch = useRef<null | { distance: number; zoom: number; world: Point }>(null);
 
-  // Measurement state
-  const [ppm, setPPM] = useState<number | null>(null); // pixels per meter
-  const [refLength, setRefLength] = useState<number>(4);
-  const [units, setUnits] = useState<Units>("m");
-  const [lines, setLines] = useState<Line[]>([]);
-  const [calLine, setCalLine] = useState<Line | null>(null);
+  const document = useFloorplanStore((state) => state.document);
+  const tool = useFloorplanStore((state) => state.tool);
+  const past = useFloorplanStore((state) => state.past);
+  const future = useFloorplanStore((state) => state.future);
+  const actions = useFloorplanStore();
+  const { points, edges, activePointId, calibration, ppm, refLength, units, orthogonal } = document;
+  useEffect(() => { viewRef.current = view; }, [view]);
 
-  // Misc
-  const dpr = typeof window !== "undefined" ? window.devicePixelRatio || 1 : 1;
+  const activePoint = activePointId ? points[activePointId] : null;
+  const loops = useMemo(() => closedFaces(edges, points), [edges, points]);
+  const totalArea = ppm ? loops.reduce((sum, loop) => sum + loop.areaPx / (ppm * ppm), 0) : 0;
+  const worldToScreen = useCallback((point: Pick<Point, "x" | "y">) => ({ x: point.x * viewRef.current.zoom + viewRef.current.offset.x, y: point.y * viewRef.current.zoom + viewRef.current.offset.y }), []);
+  const screenToWorld = useCallback((x: number, y: number): Point => ({ id: "pointer", x: (x - viewRef.current.offset.x) / viewRef.current.zoom, y: (y - viewRef.current.offset.y) / viewRef.current.zoom }), []);
+  const eventScreen = (event: { currentTarget: HTMLCanvasElement; clientX: number; clientY: number }) => { const rect = event.currentTarget.getBoundingClientRect(); return { x: event.clientX - rect.left, y: event.clientY - rect.top }; };
+  const pointAt = useCallback((screen: { x: number; y: number }) => {
+    let best: { id: string; distance: number } | null = null;
+    for (const point of Object.values(points)) { const p = worldToScreen(point); const d = Math.hypot(p.x - screen.x, p.y - screen.y); if (d <= HIT_RADIUS && (!best || d < best.distance)) best = { id: point.id, distance: d }; }
+    return best?.id ?? null;
+  }, [points, worldToScreen]);
+  const segmentAt = useCallback((screen: { x: number; y: number }) => {
+    let best: { edgeId: string; point: Point; distance: number } | null = null;
+    for (const edge of edges) {
+      const a = points[edge.a]; const b = points[edge.b]; if (!a || !b) continue;
+      const sa = worldToScreen(a); const sb = worldToScreen(b); const dx = sb.x - sa.x; const dy = sb.y - sa.y; const lengthSquared = dx * dx + dy * dy;
+      if (!lengthSquared) continue;
+      const t = clamp(((screen.x - sa.x) * dx + (screen.y - sa.y) * dy) / lengthSquared, 0, 1);
+      const projection = { x: sa.x + t * dx, y: sa.y + t * dy }; const d = Math.hypot(screen.x - projection.x, screen.y - projection.y);
+      if (d <= 7 && (!best || d < best.distance)) best = { edgeId: edge.id, point: { id: "segment", x: a.x + t * (b.x - a.x), y: a.y + t * (b.y - a.y) }, distance: d };
+    }
+    return best;
+  }, [edges, points, worldToScreen]);
+  const snappedPoint = useCallback((raw: Point, hitId: string | null, origin?: Point | null) => {
+    if (hitId && points[hitId]) return points[hitId];
+    return orthogonal && origin ? orthogonalPoint(origin, raw) : raw;
+  }, [orthogonal, points]);
 
-  // Unit helpers
-  const unitFactor = useMemo(() => {
-    if (units === "m") return 1;
-    if (units === "cm") return 100;
-    return 1000; // mm
-  }, [units]);
-  const fmtLength = (meters: number | undefined) => {
-    if (meters == null || Number.isNaN(meters)) return "";
-    const v = meters * unitFactor;
-    const decimals = units === "m" ? 2 : 0;
-    return `${v.toFixed(decimals)} ${units}`;
-  };
-
-  // Geometry helpers
-  const lengthPx = (l: Line) => Math.hypot(l.x2 - l.x1, l.y2 - l.y1);
-  const screenToWorld = (sx: number, sy: number) => ({
-    x: (sx - offsetRef.current.x) / zoomRef.current,
-    y: (sy - offsetRef.current.y) / zoomRef.current,
-  });
-  const screenToWorldWith = (
-    sx: number,
-    sy: number,
-    z: number,
-    off: { x: number; y: number }
-  ) => ({ x: (sx - off.x) / z, y: (sy - off.y) / z });
-
-  // Resize canvas to container
-  useEffect(() => {
-    const resize = () => {
-      const canvas = canvasRef.current;
-      const parent = containerRef.current;
-      if (!canvas || !parent) return;
-      const rect = parent.getBoundingClientRect();
-      canvas.width = Math.max(1, Math.floor(rect.width * dpr));
-      canvas.height = Math.max(1, Math.floor(rect.height * dpr));
-      canvas.style.width = `${rect.width}px`;
-      canvas.style.height = `${rect.height}px`;
-      draw();
-    };
-    resize();
-    const ro = new ResizeObserver(resize);
-    if (containerRef.current) ro.observe(containerRef.current);
-    return () => ro.disconnect();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [dpr, zoom, offset, lines, tempLine, calLine, ppm, units, hasImage]);
-
-  // Keyboard
-  useEffect(() => {
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Shift") setShiftDown(true);
-      if (e.key === " ") {
-        e.preventDefault();
-        setSpaceDown(true);
-      }
-      if (e.key === "2") setMode("calibrate");
-      if (e.key === "3") setMode("measure");
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z")
-        setLines((prev) => prev.slice(0, -1));
-      if (e.key === "Escape") {
-        setTempLine(null);
-        setPanStart(null);
-        setIsPanning(false);
-      }
-    };
-    const onKeyUp = (e: KeyboardEvent) => {
-      if (e.key === "Shift") setShiftDown(false);
-      if (e.key === " ") setSpaceDown(false);
-    };
-    window.addEventListener("keydown", onKeyDown, { capture: true });
-    window.addEventListener("keyup", onKeyUp, { capture: true });
-    return () => {
-      window.removeEventListener(
-        "keydown",
-        onKeyDown as unknown as EventListener,
-        { capture: true }
-      );
-      window.removeEventListener("keyup", onKeyUp as unknown as EventListener, {
-        capture: true,
-      });
-    };
+  const fitImage = useCallback(() => {
+    const container = containerRef.current; if (!imageInfo || !container) return;
+    const rect = container.getBoundingClientRect(); const zoom = Math.min(rect.width / imageInfo.width, rect.height / imageInfo.height) * 0.94;
+    setView({ zoom, offset: { x: (rect.width - imageInfo.width * zoom) / 2, y: (rect.height - imageInfo.height * zoom) / 2 } });
+  }, [imageInfo]);
+  const loadImage = useCallback((info: ImageInfo) => {
+    pdfPageRef.current = null; renderedPdfViewRef.current = null; setImageInfo({ ...info, kind: "image" });
   }, []);
-
-  // Persistence save
-  const savePending = useRef(false);
-  const snapshotAndSave = () => {
-    if (!hasImage) return;
-    const state: SavedState = {
-      img:
-        imgDataUrl && imgInfo
-          ? {
-              dataUrl: imgDataUrl,
-              name: imgInfo.name,
-              w: imgInfo.w,
-              h: imgInfo.h,
-            }
-          : undefined,
-      ppm,
-      refLength,
-      units,
-      lines,
-      calLine,
-      zoom: zoomRef.current,
-      offset: offsetRef.current,
-    };
+  useEffect(() => { if (imageInfo) requestAnimationFrame(fitImage); }, [fitImage, imageInfo]);
+  const openImage = useCallback((dataUrl: string, name: string) => {
+    const probe = new Image();
+    probe.onload = () => { actions.reset(); actions.setTool("calibrate"); loadImage({ dataUrl, name, width: probe.width, height: probe.height }); };
+    probe.onerror = () => setFileError("This image could not be opened.");
+    probe.src = dataUrl;
+  }, [actions, loadImage]);
+  const onFile = async (file: File) => {
+    setFileError(null);
+    const isPdf = file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf");
+    if (!isPdf && !file.type.startsWith("image/")) { setFileError("Choose an image or PDF floor plan."); return; }
+    setIsLoadingFile(true);
     try {
-      localStorage.setItem(LS_KEY, JSON.stringify(state));
-    } catch (err) {
-      console.error("Failed to persist state", err);
-    }
+      if (!isPdf) { openImage(await new Promise<string>((resolve, reject) => { const reader = new FileReader(); reader.onload = () => resolve(String(reader.result)); reader.onerror = () => reject(new Error("Unable to read image.")); reader.readAsDataURL(file); }), file.name); return; }
+      const dataUrl = await new Promise<string>((resolve, reject) => { const reader = new FileReader(); reader.onload = () => resolve(String(reader.result)); reader.onerror = () => reject(new Error("Unable to read PDF.")); reader.readAsDataURL(file); });
+      const pdf = await getDocument({ data: new Uint8Array(await file.arrayBuffer()) }).promise;
+      const page = await pdf.getPage(1);
+      const viewport = page.getViewport({ scale: 1 });
+      pdfPageRef.current = page; setPdfRevision((revision) => revision + 1);
+      actions.reset(); actions.setTool("calibrate"); setImageInfo({ kind: "pdf", dataUrl, name: file.name, width: viewport.width, height: viewport.height });
+    } catch {
+      setFileError("This PDF could not be rendered. Try a different file or convert it to an image.");
+    } finally { setIsLoadingFile(false); }
   };
-  useEffect(() => {
-    if (!hasImage) return;
-    if (savePending.current) return;
-    savePending.current = true;
-    requestAnimationFrame(() => {
-      savePending.current = false;
-      snapshotAndSave();
-    });
-  }, [
-    imgDataUrl,
-    imgInfo,
-    ppm,
-    refLength,
-    units,
-    lines,
-    calLine,
-    zoom,
-    offset,
-    hasImage,
-  ]);
 
-  // Persistence load on mount
+  const resetFloorplan = useCallback(() => {
+    actions.reset();
+    pdfPageRef.current = null;
+    renderedPdfViewRef.current = null;
+    setImageInfo(null);
+    setPdfRevision(0);
+    setFileError(null);
+    setView({ zoom: 1, offset: { x: 0, y: 0 } });
+    setPointerWorld(null);
+    setHoveredPointId(null);
+    setHoveredSegment(null);
+    setCalibrationStart(null);
+    interaction.current = null;
+    touches.current.clear();
+    pinch.current = null;
+    localStorage.removeItem(LS_KEY);
+  }, [actions]);
+
   useEffect(() => {
-    try {
-      const raw = localStorage.getItem(LS_KEY);
-      if (!raw) return;
-      const s: SavedState = JSON.parse(raw);
-      setUnits(s.units ?? "m");
-      setPPM(s.ppm ?? null);
-      setRefLength(s.refLength ?? 4);
-      setLines(Array.isArray(s.lines) ? s.lines : []);
-      setCalLine(s.calLine ?? null);
-      setZoom(s.zoom ?? 1);
-      setOffset(s.offset ?? { x: 0, y: 0 });
-      if (s.img?.dataUrl) {
-        const { dataUrl, name } = s.img;
-        const img = new Image();
-        img.onload = () => {
-          imgRef.current = img;
-          setImgInfo({ w: img.width, h: img.height, name });
-          setImgDataUrl(dataUrl);
-          setHasImage(true);
-          requestAnimationFrame(() => fitImageToView());
-          draw();
-        };
-        img.src = dataUrl;
-      }
-    } catch (err) {
-      console.error("Failed to restore state", err);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    const raw = localStorage.getItem(LS_KEY);
+    if (!raw) { setHydrated(true); return; }
+    try { const saved = JSON.parse(raw) as { document: Document; image: BackgroundInfo | null; view: View }; if (saved.document) actions.restore(saved.document); if (saved.view) setView(saved.view); if (saved.image) { if (saved.image.kind === "pdf") setImageInfo(saved.image); else loadImage(saved.image); } }
+    catch { localStorage.removeItem(LS_KEY); }
+    finally { setHydrated(true); }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
-
-  // Dynamic recalibration
+  useEffect(() => { if (hydrated) localStorage.setItem(LS_KEY, JSON.stringify({ document, image: imageInfo, view })); }, [document, hydrated, imageInfo, view]);
   useEffect(() => {
-    if (calLine && refLength > 0) setPPM(lengthPx(calLine) / refLength);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [refLength, calLine]);
-
-  // Image upload: fast preview via ObjectURL, persist via DataURL
-  const onFile = (file: File) => {
-    if (!file) return;
-    if (!file.type.startsWith("image/")) {
-      alert("Please select an image file.");
-      return;
+    if (!imageInfo || imageInfo.kind !== "pdf" || pdfPageRef.current) return;
+    let cancelled = false;
+    void (async () => { try { const bytes = new Uint8Array(await (await fetch(imageInfo.dataUrl)).arrayBuffer()); const page = await (await getDocument({ data: bytes }).promise).getPage(1); if (!cancelled) { pdfPageRef.current = page; setPdfRevision((revision) => revision + 1); } } catch { if (!cancelled) setFileError("This saved PDF could not be restored."); } })();
+    return () => { cancelled = true; };
+  }, [imageInfo]);
+  useEffect(() => {
+    const page = pdfPageRef.current; const canvas = pdfCanvasRef.current; const container = containerRef.current;
+    if (!page || !canvas || !container || imageInfo?.kind !== "pdf") return;
+    let cancelled = false;
+    const previous = renderedPdfViewRef.current;
+    if (previous) {
+      const scale = view.zoom / previous.zoom;
+      const translateX = view.offset.x - previous.offset.x * scale;
+      const translateY = view.offset.y - previous.offset.y * scale;
+      canvas.style.transform = `matrix(${scale}, 0, 0, ${scale}, ${translateX}, ${translateY})`;
     }
-    try {
-      const url = URL.createObjectURL(file);
-      const img = new Image();
-      img.onload = () => {
-        URL.revokeObjectURL(url);
-        imgRef.current = img;
-        setImgInfo({ w: img.width, h: img.height, name: file.name });
-        setHasImage(true);
-        setMode("calibrate");
-        setLines([]);
-        setCalLine(null);
-        requestAnimationFrame(() => fitImageToView());
-        draw();
-      };
-      img.onerror = () => alert("Could not load the selected image");
-      img.src = url;
+    if (pdfRenderTimerRef.current) window.clearTimeout(pdfRenderTimerRef.current);
+    pdfRenderRef.current?.cancel();
+    const render = async () => {
+      const dpr = window.devicePixelRatio || 1; const rect = container.getBoundingClientRect();
+      const renderView = view;
+      const viewport = page.getViewport({ scale: renderView.zoom * dpr });
+      canvas.width = Math.ceil(rect.width * dpr); canvas.height = Math.ceil(rect.height * dpr);
+      canvas.style.width = `${rect.width}px`; canvas.style.height = `${rect.height}px`; canvas.style.transform = "none";
+      const context = canvas.getContext("2d"); if (!context) return;
+      const task = page.render({ canvas, canvasContext: context, viewport, transform: [1, 0, 0, 1, renderView.offset.x * dpr, renderView.offset.y * dpr] });
+      pdfRenderRef.current = task;
+      await task.promise;
+      if (pdfRenderRef.current === task) { pdfRenderRef.current = null; renderedPdfViewRef.current = renderView; }
+    };
+    pdfRenderTimerRef.current = window.setTimeout(() => { void render().catch(() => { if (!cancelled) setFileError("This PDF could not be rendered."); }); }, 120);
+    return () => { cancelled = true; if (pdfRenderTimerRef.current) window.clearTimeout(pdfRenderTimerRef.current); pdfRenderRef.current?.cancel(); };
+  }, [imageInfo, pdfRevision, view]);
 
-      const reader = new FileReader();
-      reader.onload = () => setImgDataUrl(reader.result as string);
-      reader.readAsDataURL(file);
-    } catch (err) {
-      console.error(err);
-      alert("Image load failed.");
-    }
-  };
+  const formatLength = useCallback((meters: number) => units === "m" ? `${meters.toFixed(2)} m` : units === "cm" ? `${(meters * 100).toFixed(0)} cm` : `${(meters * 1000).toFixed(0)} mm`, [units]);
+  const formatArea = (sqm: number) => `${sqm.toFixed(2)} m²`;
 
-  const fitImageToView = () => {
-    const tryFit = (attempt: number) => {
-      const img = imgRef.current;
-      const parent = containerRef.current;
-      if (!img || !parent) return;
-      const rect = parent.getBoundingClientRect();
-      if ((rect.width < 2 || rect.height < 2) && attempt < 10) {
-        requestAnimationFrame(() => tryFit(attempt + 1));
+  const draw = useCallback(() => {
+    const canvas = canvasRef.current; if (!canvas) return;
+    const ctx = canvas.getContext("2d"); if (!ctx) return;
+    const dpr = window.devicePixelRatio || 1; const rect = canvas.getBoundingClientRect();
+    if (canvas.width !== Math.round(rect.width * dpr) || canvas.height !== Math.round(rect.height * dpr)) { canvas.width = Math.round(rect.width * dpr); canvas.height = Math.round(rect.height * dpr); }
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0); ctx.clearRect(0, 0, rect.width, rect.height);
+    const screenPoint = (id: string) => { const dragged = interaction.current?.pointId === id ? interaction.current.currentPoint : null; const point = dragged ?? points[id]; return point ? { x: point.x * view.zoom + view.offset.x, y: point.y * view.zoom + view.offset.y } : null; };
+    const label = (text: string, x: number, y: number, accent = false) => { ctx.save(); ctx.font = "600 12px ui-sans-serif, system-ui"; const width = ctx.measureText(text).width + 14; ctx.fillStyle = accent ? "rgba(5, 150, 105, .94)" : "rgba(15, 23, 42, .88)"; ctx.beginPath(); ctx.roundRect(x - width / 2, y - 12, width, 24, 7); ctx.fill(); ctx.fillStyle = "white"; ctx.textAlign = "center"; ctx.textBaseline = "middle"; ctx.fillText(text, x, y); ctx.restore(); };
+    const stroke = (a: { x: number; y: number }, b: { x: number; y: number }, color: string, dashed = false) => { ctx.save(); ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.setLineDash(dashed ? [7, 6] : []); ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke(); ctx.restore(); };
+    if (calibration) { const a = worldToScreen(calibration.a); const b = worldToScreen(calibration.b); stroke(a, b, "#f59e0b"); label(`${refLength} m reference`, (a.x + b.x) / 2, (a.y + b.y) / 2); }
+    edges.forEach((edge) => { const a = screenPoint(edge.a); const b = screenPoint(edge.b); if (!a || !b) return; stroke(a, b, "#059669"); if (ppm) label(formatLength(edgeLength(edge, points) / ppm), (a.x + b.x) / 2, (a.y + b.y) / 2); });
+    if (calibrationStart && pointerWorld) stroke(worldToScreen(calibrationStart), worldToScreen(snappedPoint(pointerWorld, hoveredPointId, calibrationStart)), "#f59e0b", true);
+    if (activePoint && pointerWorld) stroke(worldToScreen(activePoint), worldToScreen(snappedPoint(pointerWorld, hoveredPointId, activePoint)), "#0284c7", true);
+    Object.values(points).forEach((point) => { const p = screenPoint(point.id); if (!p) return; ctx.beginPath(); ctx.arc(p.x, p.y, point.id === hoveredPointId ? 6 : 4.5, 0, Math.PI * 2); ctx.fillStyle = point.id === hoveredPointId ? "#0f172a" : "white"; ctx.fill(); ctx.lineWidth = 2; ctx.strokeStyle = "#059669"; ctx.stroke(); });
+    if (hoveredSegment && pointerWorld) { const p = worldToScreen(pointerWorld); ctx.beginPath(); ctx.arc(p.x, p.y, 5, 0, Math.PI * 2); ctx.fillStyle = "white"; ctx.fill(); ctx.lineWidth = 2; ctx.strokeStyle = "#0284c7"; ctx.stroke(); }
+  }, [activePoint, calibration, calibrationStart, edges, formatLength, hoveredPointId, hoveredSegment, loops, pointerWorld, points, ppm, refLength, snappedPoint, view, worldToScreen]);
+  useEffect(() => { const observer = new ResizeObserver(draw); if (containerRef.current) observer.observe(containerRef.current); draw(); return () => observer.disconnect(); }, [draw]);
+
+  const zoomAt = useCallback((factor: number, center?: { x: number; y: number }) => {
+    const rect = canvasRef.current?.getBoundingClientRect(); const c = center ?? { x: (rect?.width ?? 0) / 2, y: (rect?.height ?? 0) / 2 };
+    setView((current) => { const world = { x: (c.x - current.offset.x) / current.zoom, y: (c.y - current.offset.y) / current.zoom }; const zoom = clamp(current.zoom * factor, 0.05, 20); return { zoom, offset: { x: c.x - world.x * zoom, y: c.y - world.y * zoom } }; });
+  }, []);
+  useEffect(() => {
+    const canvas = canvasRef.current; if (!canvas) return;
+    const wheel = (event: WheelEvent) => { event.preventDefault(); const rect = canvas.getBoundingClientRect(); if (event.ctrlKey || event.metaKey) zoomAt(Math.exp(-event.deltaY * 0.01), { x: event.clientX - rect.left, y: event.clientY - rect.top }); else setView((current) => ({ ...current, offset: { x: current.offset.x - event.deltaX, y: current.offset.y - event.deltaY } })); };
+    canvas.addEventListener("wheel", wheel, { passive: false }); return () => canvas.removeEventListener("wheel", wheel);
+  }, [zoomAt]);
+  useEffect(() => {
+    const keydown = (event: KeyboardEvent) => {
+      // Escape must be intercepted before focused controls or other listeners can act on it.
+      if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        setCalibrationStart(null);
+        actions.cancelDraft();
         return;
       }
-      const zw = rect.width / img.width;
-      const zh = rect.height / img.height;
-      let z = Math.min(zw, zh) * 0.95;
-      if (!Number.isFinite(z) || z <= 0) z = 1;
-      const ox = (rect.width - img.width * z) / 2;
-      const oy = (rect.height - img.height * z) / 2;
-      setZoom(z);
-      setOffset({ x: ox, y: oy });
-    };
-    tryFit(0);
-  };
 
-  // Drag and drop
-  const handleDrop: React.DragEventHandler<HTMLDivElement> = (e) => {
-    e.preventDefault();
-    const f = e.dataTransfer.files?.[0];
-    if (f) onFile(f);
-  };
-
-  // Zoom helpers
-  const ZOOM_MIN = 0.05;
-  const ZOOM_MAX = 20;
-  const computeZoomAroundPoint = (
-    zoom0: number,
-    off0: { x: number; y: number },
-    cx: number,
-    cy: number,
-    factor: number
-  ) => {
-    const newZoom = clamp(zoom0 * factor, ZOOM_MIN, ZOOM_MAX);
-    const worldBefore = screenToWorldWith(cx, cy, zoom0, off0);
-    const newOffset = {
-      x: cx - worldBefore.x * newZoom,
-      y: cy - worldBefore.y * newZoom,
+      const editingField = event.target instanceof HTMLInputElement || event.target instanceof HTMLSelectElement;
+      if (!editingField && event.key === " " && !event.repeat) { event.preventDefault(); setSpaceDown(true); }
+      if (event.key === "Enter") { setCalibrationStart(null); actions.cancelDraft(); }
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "z") { event.preventDefault(); if (event.shiftKey) actions.redo(); else actions.undo(); }
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "y") { event.preventDefault(); actions.redo(); }
+      if (editingField) return;
+      if (event.key.toLowerCase() === "c") actions.setTool("calibrate");
+      if (event.key.toLowerCase() === "d" && ppm) actions.setTool("draw");
     };
-    return { newZoom, newOffset };
-  };
-  const zoomAt = (factor: number, mx?: number, my?: number) => {
-    const canvas = canvasRef.current;
-    const rect = canvas?.getBoundingClientRect();
-    const cx = mx ?? (rect ? rect.width / 2 : 0);
-    const cy = my ?? (rect ? rect.height / 2 : 0);
-    const { newZoom, newOffset } = computeZoomAroundPoint(
-      zoomRef.current,
-      offsetRef.current,
-      cx,
-      cy,
-      factor
-    );
-    setZoom(newZoom);
-    setOffset(newOffset);
-  };
-
-  // Safari gestures
-  useEffect(() => {
-    const el = canvasRef.current;
-    if (!el) return;
-    let prevScale = 1;
-    const onGestureStart = (e: Event) => {
-      e.preventDefault();
-      prevScale = 1;
-    };
-    const onGestureChange = (e: any) => {
-      e.preventDefault();
-      const rect = el.getBoundingClientRect();
-      const cx = rect.width / 2;
-      const cy = rect.height / 2;
-      const factor = (e.scale || 1) / (prevScale || 1);
-      prevScale = e.scale || 1;
-      zoomAt(factor, cx, cy);
-    };
-    const onGestureEnd = (e: Event) => {
-      e.preventDefault();
-    };
-    el.addEventListener("gesturestart", onGestureStart as EventListener, {
-      passive: false,
-    });
-    el.addEventListener("gesturechange", onGestureChange as EventListener, {
-      passive: false,
-    });
-    el.addEventListener("gestureend", onGestureEnd as EventListener, {
-      passive: false,
-    });
+    const keyup = (event: KeyboardEvent) => { if (event.key === " ") setSpaceDown(false); };
+    window.addEventListener("keydown", keydown, { capture: true });
+    window.addEventListener("keyup", keyup);
     return () => {
-      el.removeEventListener("gesturestart", onGestureStart as EventListener);
-      el.removeEventListener("gesturechange", onGestureChange as EventListener);
-      el.removeEventListener("gestureend", onGestureEnd as EventListener);
+      window.removeEventListener("keydown", keydown, { capture: true });
+      window.removeEventListener("keyup", keyup);
     };
-  }, []);
+  }, [actions, ppm]);
 
-  // Wheel: pan by default, zoom when ctrlKey (Mac pinch path). Prevent page scroll.
-  const wheelAccumRef = useRef(0);
-  const wheelRafRef = useRef<number | null>(null);
-  useEffect(() => {
-    const el = canvasRef.current;
-    if (!el) return;
-    const onWheel = (e: WheelEvent) => {
-      e.preventDefault();
-      e.stopPropagation();
-      const rect = el.getBoundingClientRect();
-      const mx = e.clientX - rect.left;
-      const my = e.clientY - rect.top;
-      if (e.ctrlKey) {
-        const sens = 0.02; // tuned for macOS
-        wheelAccumRef.current += -e.deltaY * sens;
-        if (!wheelRafRef.current) {
-          wheelRafRef.current = requestAnimationFrame(() => {
-            const dz = wheelAccumRef.current;
-            wheelAccumRef.current = 0;
-            wheelRafRef.current = null;
-            const factor = Math.exp(dz);
-            const { newZoom, newOffset } = computeZoomAroundPoint(
-              zoomRef.current,
-              offsetRef.current,
-              mx,
-              my,
-              factor
-            );
-            setZoom(newZoom);
-            setOffset(newOffset);
-          });
-        }
-      } else {
-        setOffset((o) => ({ x: o.x - e.deltaX, y: o.y - e.deltaY }));
-      }
-    };
-    el.addEventListener("wheel", onWheel, { passive: false });
-    return () => el.removeEventListener("wheel", onWheel as EventListener);
-  }, []);
-
-  // Touch pinch via Pointer Events
-  const pointers = useRef(
-    new Map<number, { x: number; y: number; type: string }>()
-  );
-  const pinch = useRef<null | {
-    startZoom: number;
-    startOffset: { x: number; y: number };
-    startWorld: { x: number; y: number };
-    startDist: number;
-  }>(null);
-  const onPointerDown: React.PointerEventHandler<HTMLCanvasElement> = (e) => {
-    if (e.pointerType !== "touch") return;
-    const el = e.currentTarget as HTMLCanvasElement;
-    el.setPointerCapture(e.pointerId);
-    pointers.current.set(e.pointerId, {
-      x: e.clientX,
-      y: e.clientY,
-      type: e.pointerType,
-    });
-    if (pointers.current.size === 2) {
-      const pts = Array.from(pointers.current.values());
-      const mid = {
-        x: (pts[0].x + pts[1].x) / 2,
-        y: (pts[0].y + pts[1].y) / 2,
-      };
-      const rect = el.getBoundingClientRect();
-      const cx = mid.x - rect.left;
-      const cy = mid.y - rect.top;
-      const dx = pts[0].x - pts[1].x;
-      const dy = pts[0].y - pts[1].y;
-      const dist = Math.hypot(dx, dy);
-      const startZoom = zoomRef.current;
-      const startOffset = offsetRef.current;
-      const startWorld = screenToWorldWith(cx, cy, startZoom, startOffset);
-      pinch.current = { startZoom, startOffset, startWorld, startDist: dist };
-    }
+  const onPointerDown: React.PointerEventHandler<HTMLCanvasElement> = (event) => {
+    const screen = eventScreen(event);
+    if (event.pointerType === "touch") { touches.current.set(event.pointerId, { x: event.clientX, y: event.clientY }); event.currentTarget.setPointerCapture(event.pointerId); if (touches.current.size === 2) { const [a, b] = [...touches.current.values()]; const rect = event.currentTarget.getBoundingClientRect(); const center = { x: (a.x + b.x) / 2 - rect.left, y: (a.y + b.y) / 2 - rect.top }; pinch.current = { distance: Math.hypot(a.x - b.x, a.y - b.y), zoom: viewRef.current.zoom, world: screenToWorld(center.x, center.y) }; } return; }
+    const wantsPan = spaceDown || event.button === 1 || event.button === 2;
+    if (wantsPan) { event.currentTarget.setPointerCapture(event.pointerId); interaction.current = { kind: "pan", pointerId: event.pointerId, startScreen: screen, startOffset: viewRef.current.offset, moved: false }; return; }
+    if (!imageInfo || event.button !== 0) return;
+    const hitId = pointAt(screen);
+    if (tool === "draw" && hitId) { event.currentTarget.setPointerCapture(event.pointerId); interaction.current = { kind: "point", pointerId: event.pointerId, pointId: hitId, startPoint: points[hitId], currentPoint: points[hitId], startScreen: screen, moved: false }; return; }
+    const raw = screenToWorld(screen.x, screen.y);
+    if (tool === "draw" && ppm) { const segment = segmentAt(screen); if (segment) { const pointId = actions.insertPointOnEdge(segment.edgeId, segment.point); event.currentTarget.setPointerCapture(event.pointerId); interaction.current = { kind: "point", pointerId: event.pointerId, pointId, startPoint: { ...segment.point, id: pointId }, currentPoint: { ...segment.point, id: pointId }, startScreen: screen, moved: false, inserted: true }; return; } actions.addDrawingClick(snappedPoint(raw, null, activePoint), null); return; }
+    if (tool === "calibrate") { if (!calibrationStart) setCalibrationStart(raw); else { const end = snappedPoint(raw, null, calibrationStart); if (distance(calibrationStart, end) > 1 && refLength > 0) { actions.setCalibration(calibrationStart, end); actions.setTool("draw"); } setCalibrationStart(null); } }
   };
-  const onPointerMove: React.PointerEventHandler<HTMLCanvasElement> = (e) => {
-    if (e.pointerType !== "touch") return;
-    if (!pointers.current.has(e.pointerId)) return;
-    pointers.current.set(e.pointerId, {
-      x: e.clientX,
-      y: e.clientY,
-      type: e.pointerType,
-    });
-    if (pointers.current.size === 2 && pinch.current) {
-      const el = e.currentTarget as HTMLCanvasElement;
-      const rect = el.getBoundingClientRect();
-      const pts = Array.from(pointers.current.values());
-      const mid = {
-        x: (pts[0].x + pts[1].x) / 2,
-        y: (pts[0].y + pts[1].y) / 2,
-      };
-      const dx = pts[0].x - pts[1].x;
-      const dy = pts[0].y - pts[1].y;
-      const dist = Math.hypot(dx, dy);
-      const factor = dist / pinch.current.startDist;
-      const cx = mid.x - rect.left;
-      const cy = mid.y - rect.top;
-      const newZoom = clamp(
-        pinch.current.startZoom * factor,
-        ZOOM_MIN,
-        ZOOM_MAX
-      );
-      const newOffset = {
-        x: cx - pinch.current.startWorld.x * newZoom,
-        y: cy - pinch.current.startWorld.y * newZoom,
-      };
-      setZoom(newZoom);
-      setOffset(newOffset);
-    }
+  const onPointerMove: React.PointerEventHandler<HTMLCanvasElement> = (event) => {
+    const screen = eventScreen(event);
+    if (event.pointerType === "touch") { if (!touches.current.has(event.pointerId)) return; touches.current.set(event.pointerId, { x: event.clientX, y: event.clientY }); if (touches.current.size === 2 && pinch.current) { const [a, b] = [...touches.current.values()]; const rect = event.currentTarget.getBoundingClientRect(); const center = { x: (a.x + b.x) / 2 - rect.left, y: (a.y + b.y) / 2 - rect.top }; const zoom = clamp(pinch.current.zoom * Math.hypot(a.x - b.x, a.y - b.y) / pinch.current.distance, 0.05, 20); setView({ zoom, offset: { x: center.x - pinch.current.world.x * zoom, y: center.y - pinch.current.world.y * zoom } }); } return; }
+    const current = interaction.current;
+    if (current?.pointerId === event.pointerId) { const delta = { x: screen.x - current.startScreen.x, y: screen.y - current.startScreen.y }; if (Math.hypot(delta.x, delta.y) > 3) current.moved = true; if (current.kind === "pan" && current.startOffset) setView((v) => ({ ...v, offset: { x: current.startOffset!.x + delta.x, y: current.startOffset!.y + delta.y } })); if (current.kind === "point" && current.startPoint) { current.currentPoint = { ...current.startPoint, x: current.startPoint.x + delta.x / viewRef.current.zoom, y: current.startPoint.y + delta.y / viewRef.current.zoom }; setPointerWorld(current.currentPoint); } return; }
+    const hitId = pointAt(screen); const segment = hitId ? null : segmentAt(screen); setHoveredPointId(hitId); setHoveredSegment(segment?.edgeId ?? null); setPointerWorld(segment?.point ?? screenToWorld(screen.x, screen.y));
   };
-  const onPointerUp: React.PointerEventHandler<HTMLCanvasElement> = (e) => {
-    if (e.pointerType !== "touch") return;
-    pointers.current.delete(e.pointerId);
-    if (pointers.current.size < 2) pinch.current = null;
-  };
-  const onPointerCancel: React.PointerEventHandler<HTMLCanvasElement> = (e) => {
-    if (e.pointerType !== "touch") return;
-    pointers.current.delete(e.pointerId);
-    pinch.current = null;
-  };
+  const endPointer: React.PointerEventHandler<HTMLCanvasElement> = (event) => { if (event.pointerType === "touch") { touches.current.delete(event.pointerId); if (touches.current.size < 2) pinch.current = null; return; } const current = interaction.current; if (current?.pointerId === event.pointerId) { if (current.kind === "point" && current.pointId) { if (current.moved && current.currentPoint) actions.movePoint(current.pointId, current.currentPoint); else if (!current.inserted && ppm) actions.addDrawingClick(points[current.pointId], current.pointId); } interaction.current = null; } };
 
-  // Mouse: draw and pan
-  const handleMouseDown: React.MouseEventHandler<HTMLCanvasElement> = (e) => {
-    const rect = e.currentTarget.getBoundingClientRect();
-    const sx = e.clientX - rect.left;
-    const sy = e.clientY - rect.top;
-    const wantsPan = spaceDown || e.button === 1 || e.button === 2;
-    if (wantsPan) {
-      setIsPanning(true);
-      setPanStart({
-        x: sx,
-        y: sy,
-        ox: offsetRef.current.x,
-        oy: offsetRef.current.y,
-      });
-      setIsDragging(true);
-      return;
-    }
-    if (!imgRef.current) return;
-    const { x, y } = screenToWorld(sx, sy);
-    setDragStartWorld({ x, y });
-    setTempLine({ id: "temp", x1: x, y1: y, x2: x, y2: y });
-    setIsDragging(true);
-  };
-  const handleMouseMove: React.MouseEventHandler<HTMLCanvasElement> = (e) => {
-    const rect = e.currentTarget.getBoundingClientRect();
-    const sx = e.clientX - rect.left;
-    const sy = e.clientY - rect.top;
-    if (isPanning && panStart && isDragging) {
-      const dx = sx - panStart.x;
-      const dy = sy - panStart.y;
-      setOffset({ x: panStart.ox + dx, y: panStart.oy + dy });
-      draw();
-      return;
-    }
-    if (!isDragging || !dragStartWorld) return;
-    let { x, y } = screenToWorld(sx, sy);
-    if (shiftDown) {
-      const dx = Math.abs(x - dragStartWorld.x);
-      const dy = Math.abs(y - dragStartWorld.y);
-      if (dx > dy) y = dragStartWorld.y;
-      else x = dragStartWorld.x;
-    }
-    setTempLine((prev) => (prev ? { ...prev, x2: x, y2: y } : null));
-    draw();
-  };
-  const handleMouseUp: React.MouseEventHandler<HTMLCanvasElement> = () => {
-    if (isPanning) {
-      setIsDragging(false);
-      setIsPanning(false);
-      setPanStart(null);
-      return;
-    }
-    setIsDragging(false);
-    if (!tempLine || !dragStartWorld) {
-      setTempLine(null);
-      return;
-    }
-    const lp = lengthPx(tempLine);
-    if (mode === "calibrate") {
-      if (!refLength || refLength <= 0) {
-        alert("Set a positive reference length first.");
-      } else if (lp < 2) {
-        alert("Reference line is too short.");
-      } else {
-        const nextPPM = lp / refLength;
-        setPPM(nextPPM);
-        setCalLine({ ...tempLine });
-      }
-      setTempLine(null);
-      setMode("measure");
-      return;
-    }
-    if (mode === "measure") {
-      if (!ppm) {
-        alert("Calibrate first (draw the reference scale).");
-      } else if (lp >= 2) {
-        setLines((prev) => [...prev, { ...tempLine, id: `m-${Date.now()}` }]);
-      }
-      setTempLine(null);
-      return;
-    }
-    setTempLine(null);
-  };
+  const cursor = spaceDown ? "grab" : (hoveredPointId || hoveredSegment) && tool === "draw" ? "pointer" : "crosshair";
+  const toolButton = (value: Tool, label: string, shortcut: string, disabled = false) => <button disabled={disabled} onClick={() => actions.setTool(value)} className={`rounded-lg px-3 py-2 text-sm font-semibold transition ${tool === value ? "bg-slate-900 text-white shadow" : "text-slate-600 hover:bg-slate-100"} disabled:cursor-not-allowed disabled:opacity-35`} title={`${label} (${shortcut})`}>{label}<span className="ml-1 text-xs opacity-60">{shortcut}</span></button>;
 
-  const handleDoubleClick: React.MouseEventHandler<HTMLCanvasElement> = (e) => {
-    const rect = e.currentTarget.getBoundingClientRect();
-    const mx = e.clientX - rect.left;
-    const my = e.clientY - rect.top;
-    const f = e.altKey ? 1 / 1.5 : 1.5;
-    zoomAt(f, mx, my);
-  };
-  const handleContextMenu: React.MouseEventHandler<HTMLCanvasElement> = (e) => {
-    e.preventDefault();
-  };
-
-  // Drawing
-  const draw = () => {
-    const canvas = canvasRef.current;
-    const ctx = canvas?.getContext("2d");
-    const img = imgRef.current;
-    if (!canvas || !ctx) return;
-    ctx.save();
-    ctx.setTransform(1, 0, 0, 1, 0, 0);
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-    ctx.fillStyle = "#f8fafc";
-    ctx.fillRect(0, 0, canvas.width, canvas.height); // keep canvas background consistent even when zoomed out
-
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.translate(offsetRef.current.x, offsetRef.current.y);
-    ctx.scale(zoomRef.current, zoomRef.current);
-    if (img) {
-      ctx.imageSmoothingQuality = "high";
-      ctx.drawImage(img, 0, 0);
-    }
-    const drawLine = (l: Line, color = "#22c55e", dashed = false) => {
-      ctx.save();
-      if (dashed) ctx.setLineDash([8 / zoomRef.current, 8 / zoomRef.current]);
-      ctx.lineWidth = 2 / zoomRef.current;
-      ctx.strokeStyle = color;
-      ctx.beginPath();
-      ctx.moveTo(l.x1, l.y1);
-      ctx.lineTo(l.x2, l.y2);
-      ctx.stroke();
-      ctx.fillStyle = color;
-      const r = 4 / zoomRef.current;
-      ctx.beginPath();
-      ctx.arc(l.x1, l.y1, r, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.beginPath();
-      ctx.arc(l.x2, l.y2, r, 0, Math.PI * 2);
-      ctx.fill();
-      const meters =
-        l === calLine ? refLength : ppm ? lengthPx(l) / ppm : undefined;
-      if (meters != null) {
-        const cx = (l.x1 + l.x2) / 2;
-        const cy = (l.y1 + l.y2) / 2;
-        const label = fmtLength(meters);
-        ctx.font = `${Math.max(
-          10,
-          14 / Math.min(1, zoomRef.current)
-        )}px ui-sans-serif`;
-        const pad = 4 / zoomRef.current;
-        const tw = ctx.measureText(label).width;
-        const th = 18 / zoomRef.current;
-        ctx.fillStyle = "rgba(15,23,42,0.85)";
-        ctx.fillRect(
-          cx - tw / 2 - pad,
-          cy - th / 2 - pad,
-          tw + pad * 2,
-          th + pad * 2
-        );
-        ctx.fillStyle = "white";
-        ctx.textAlign = "center";
-        ctx.textBaseline = "middle";
-        ctx.fillText(label, cx, cy + 0.5 / zoomRef.current);
-      }
-      ctx.restore();
-    };
-    if (calLine) drawLine(calLine, "#f59e0b");
-    for (const l of lines) drawLine(l, "#22c55e");
-    if (tempLine)
-      drawLine(tempLine, mode === "calibrate" ? "#f59e0b" : "#0ea5e9", true);
-    ctx.restore();
-  };
-
-  useEffect(() => {
-    draw();
-  });
-
-  // Export
-  const exportPNG = () => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const link = document.createElement("a");
-    link.download = `floorplan-annotated-${Date.now()}.png`;
-    link.href = canvas.toDataURL("image/png");
-    link.click();
-  };
-
-  const reset = () => {
-    setLines([]);
-    setCalLine(null);
-    setPPM(null);
-    setMode("calibrate");
-  };
-  const zoomToFit = () => fitImageToView();
-
-  // Self-tests (console only)
-  useEffect(() => {
-    console.assert(clamp(10, 0, 5) === 5, "clamp upper");
-    console.assert(clamp(-2, 0, 5) === 0, "clamp lower");
-    const l: Line = { id: "t", x1: 0, y1: 0, x2: 3, y2: 4 };
-    console.assert(Math.abs(lengthPx(l) - 5) < 1e-9, "lengthPx 3-4-5");
-    const z0 = 1.2;
-    const off0 = { x: 100, y: 50 };
-    const cx = 200;
-    const cy = 300;
-    const wb = screenToWorldWith(cx, cy, z0, off0);
-    const { newZoom, newOffset } = computeZoomAroundPoint(
-      z0,
-      off0,
-      cx,
-      cy,
-      1.5
-    );
-    const wa = screenToWorldWith(cx, cy, newZoom, newOffset);
-    console.assert(
-      Math.hypot(wb.x - wa.x, wb.y - wa.y) < 1e-9,
-      "zoom keeps world point"
-    );
-    // Extra: fmtLength sanity
-    const prevUnits = units;
-    if (prevUnits !== "m") setUnits("m");
-    console.assert(fmtLength(1) === "1.00 m", "fmt meters");
-    setUnits("cm");
-    console.assert(fmtLength(1) === "100 cm", "fmt cm");
-    setUnits("mm");
-    console.assert(fmtLength(1) === "1000 mm", "fmt mm");
-    setUnits(prevUnits);
-  }, []);
-
-  const canvasCursor =
-    isPanning || spaceDown
-      ? isDragging
-        ? "grabbing"
-        : "grab"
-      : mode === "measure" || mode === "calibrate"
-      ? "crosshair"
-      : "default";
-
-  return (
-    <div className="w-full h-dvh max-h-dvh flex flex-col overflow-hidden text-slate-900 bg-linear-to-br from-slate-50 via-slate-50 to-slate-100">
-      {/* Toolbar */}
-      <div className="flex flex-wrap items-center gap-2 p-3 border-b border-slate-200 bg-white/90 backdrop-blur supports-backdrop-filter:bg-white/70 shadow-sm">
-        <label className="inline-flex items-center gap-2 px-3 py-2 rounded-xl border hover:bg-slate-50 cursor-pointer border-slate-200 bg-white shadow-sm">
-          <input
-            type="file"
-            accept="image/*"
-            className="hidden"
-            onChange={(e) => {
-              const f = e.currentTarget.files?.[0];
-              if (f) onFile(f);
-              e.currentTarget.value = "";
-            }}
-          />
-          <span className="font-medium">Upload floor plan</span>
-        </label>
-
-        <div className="w-px h-6 bg-slate-200" />
-
-        <div className="flex items-center gap-1 rounded-xl border border-slate-200 bg-white overflow-hidden shadow-sm">
-          <button
-            onClick={() => setMode("calibrate")}
-            className={`px-3 py-2 ${
-              mode === "calibrate"
-                ? "bg-amber-500 text-white"
-                : "hover:bg-amber-50"
-            }`}
-          >
-            Calibrate (2)
-          </button>
-          <button
-            onClick={() => setMode("measure")}
-            className={`px-3 py-2 ${
-              mode === "measure"
-                ? "bg-emerald-600 text-white"
-                : "hover:bg-emerald-50"
-            }`}
-          >
-            Measure (3)
-          </button>
-        </div>
-
-        <div className="w-px h-6 bg-slate-200" />
-
-        <div className="flex items-center gap-2 text-slate-700">
-          <span className="text-sm text-slate-600">Ref length:</span>
-          <input
-            type="number"
-            step={0.01}
-            value={refLength}
-            onChange={(e) => setRefLength(parseFloat(e.target.value))}
-            className="w-24 px-2 py-1 rounded-lg border border-slate-200 focus:outline-none focus:ring-2 focus:ring-emerald-200"
-          />
-          <span className="text-xs text-slate-500">m</span>
-        </div>
-
-        <div className="w-px h-6 bg-slate-200" />
-
-        <div className="flex items-center gap-2 text-slate-700">
-          <span className="text-sm text-slate-600">Units:</span>
-          <select
-            className="px-2 py-1 rounded-lg border border-slate-200 bg-white focus:outline-none focus:ring-2 focus:ring-emerald-200"
-            value={units}
-            onChange={(e) => setUnits(e.target.value as Units)}
-          >
-            <option value="m">meters</option>
-            <option value="cm">cm</option>
-            <option value="mm">mm</option>
-          </select>
-        </div>
-
-        <div className="ml-auto flex items-center gap-2">
-          <div className="flex items-center gap-1 rounded-xl border border-slate-200 bg-white overflow-hidden shadow-sm">
-            <button
-              title="Zoom out"
-              onClick={() => zoomAt(1 / 1.15)}
-              className="px-3 py-2 hover:bg-slate-50"
-            >
-              -
-            </button>
-            <div className="w-px h-5 bg-slate-200" />
-            <button
-              title="Zoom in"
-              onClick={() => zoomAt(1.15)}
-              className="px-3 py-2 hover:bg-slate-50"
-            >
-              +
-            </button>
-          </div>
-          <button
-            onClick={zoomToFit}
-            className="px-3 py-2 rounded-xl border border-slate-200 bg-white hover:bg-slate-50 shadow-[0_1px_2px_rgba(15,23,42,0.08)]"
-          >
-            Fit
-          </button>
-          <button
-            onClick={() => setLines((prev) => prev.slice(0, -1))}
-            className="px-3 py-2 rounded-xl border border-slate-200 bg-white hover:bg-slate-50 shadow-[0_1px_2px_rgba(15,23,42,0.08)]"
-          >
-            Undo
-          </button>
-          <button
-            onClick={reset}
-            className="px-3 py-2 rounded-xl border border-slate-200 bg-white hover:bg-slate-50 shadow-[0_1px_2px_rgba(15,23,42,0.08)]"
-          >
-            Reset
-          </button>
-          <button
-            onClick={exportPNG}
-            className="px-3 py-2 rounded-xl border border-slate-200 bg-white hover:bg-slate-50 shadow-[0_1px_2px_rgba(15,23,42,0.08)]"
-          >
-            Export PNG
-          </button>
-        </div>
-      </div>
-
-      {/* Status bar */}
-      <div className="flex flex-wrap items-center gap-4 px-3 py-2 text-sm border-b border-slate-200 bg-slate-50/80">
-        <span>
-          Mode: <b className="font-semibold capitalize">{mode}</b>
-        </span>
-        <span>|</span>
-        <span>
-          Scale:{" "}
-          <b className="font-semibold">
-            {ppm ? `${ppm.toFixed(2)} px/m` : "not set"}
-          </b>
-        </span>
-        <span>|</span>
-        <span>
-          Image:{" "}
-          <b className="font-semibold">
-            {imgInfo
-              ? `${imgInfo.w}x${imgInfo.h}${
-                  imgInfo.name ? ` (${imgInfo.name})` : ""
-                }`
-              : "none"}
-          </b>
-        </span>
-        <span>|</span>
-        <span>
-          Lines: <b className="font-semibold">{lines.length}</b>
-        </span>
-        <span className="ml-auto text-slate-500">
-          Tip: two finger scroll to pan - pinch to zoom - space+drag to pan -
-          opt double click to zoom out
-        </span>
-      </div>
-
-      {/* Canvas */}
-      <div
-        ref={containerRef}
-        onDrop={handleDrop}
-        onDragOver={(e) => e.preventDefault()}
-        className="relative flex-1 min-h-0 bg-[#eef2f9] overflow-hidden"
-        style={{ overscrollBehavior: "contain" }}
-      >
-        {!hasImage && (
-          <div className="absolute inset-0 grid place-items-center pointer-events-none select-none">
-            <div className="text-center text-slate-600 bg-white/70 backdrop-blur rounded-2xl px-6 py-4 shadow-md border border-slate-200">
-              <div className="text-lg font-semibold">
-                Upload a floor plan image to begin
-              </div>
-              <div className="text-sm mt-1">
-                Draw the scale in <b>Calibrate</b>, then switch to Measure to
-                annotate dimensions.
-              </div>
-              <div className="text-sm">Or drag and drop an image here.</div>
-            </div>
-          </div>
-        )}
-        <canvas
-          ref={canvasRef}
-          className="block w-full h-full"
-          style={{
-            cursor: canvasCursor as React.CSSProperties["cursor"],
-            touchAction: "none",
-          }}
-          onPointerDown={onPointerDown}
-          onPointerMove={onPointerMove}
-          onPointerUp={onPointerUp}
-          onPointerCancel={onPointerCancel}
-          onMouseDown={handleMouseDown}
-          onMouseMove={handleMouseMove}
-          onMouseUp={handleMouseUp}
-          onDoubleClick={handleDoubleClick}
-          onContextMenu={handleContextMenu}
-        />
-      </div>
-
-      {/* Measurements list */}
-      <div className="border-t border-slate-200 bg-white/90 px-3 py-2 text-sm backdrop-blur">
-        {lines.length === 0 ? (
-          <div className="text-slate-500">No measurements yet.</div>
-        ) : (
-          <div className="flex flex-wrap gap-2">
-            {lines.map((l, i) => (
-              <span
-                key={l.id}
-                className="px-2 py-1 rounded-lg border border-slate-200 bg-white shadow-sm"
-              >
-                #{i + 1}: {ppm ? fmtLength(lengthPx(l) / ppm) : "?"}
-              </span>
-            ))}
-          </div>
-        )}
-      </div>
+  return <main className="flex h-dvh flex-col overflow-hidden bg-slate-100 text-slate-900">
+    <header className="z-10 flex flex-wrap items-center gap-3 border-b border-slate-200 bg-white px-4 py-3 shadow-sm">
+      <label className="cursor-pointer rounded-lg bg-emerald-600 px-3 py-2 text-sm font-semibold text-white shadow hover:bg-emerald-700">{isLoadingFile ? "Opening…" : "Open floor plan"}<input className="hidden" type="file" accept="image/*,application/pdf,.pdf" onChange={(event) => { const file = event.target.files?.[0]; if (file) void onFile(file); event.target.value = ""; }} /></label>
+      <nav className="flex rounded-xl border border-slate-200 bg-slate-50 p-1" aria-label="Tools">{toolButton("calibrate", "Calibrate", "C")}{toolButton("draw", "Draw", "D", !ppm)}</nav>
+      <label className="flex items-center gap-2 text-sm text-slate-600">Reference<input aria-label="Reference length in meters" className="w-20 rounded-lg border border-slate-200 px-2 py-1.5" type="number" min="0.01" step="0.01" value={refLength} onChange={(event) => actions.setRefLength(Number(event.target.value))} />m</label>
+      <button onClick={actions.toggleOrthogonal} className={`rounded-lg border px-3 py-2 text-sm font-semibold ${orthogonal ? "border-blue-200 bg-blue-50 text-blue-700" : "border-slate-200 text-slate-500"}`} aria-pressed={orthogonal}>90° lock {orthogonal ? "on" : "off"}</button>
+      <div className="ml-auto flex items-center gap-1"><button aria-label="Undo" disabled={!past.length} onClick={actions.undo} className="toolbar-button">↶ <span>Undo</span></button><button aria-label="Redo" disabled={!future.length} onClick={actions.redo} className="toolbar-button">↷ <span>Redo</span></button><button aria-label="Zoom out" onClick={() => zoomAt(1 / 1.15)} className="toolbar-button">−</button><button aria-label="Zoom in" onClick={() => zoomAt(1.15)} className="toolbar-button">+</button><button onClick={fitImage} className="toolbar-button">Fit</button><button onClick={resetFloorplan} className="rounded-lg px-3 py-2 text-sm font-semibold text-rose-600 hover:bg-rose-50" title="Clear floor plan and start over">Clear</button></div>
+    </header>
+    <section className="flex items-center gap-4 border-b border-slate-200 bg-slate-50 px-4 py-2 text-sm"><span className={`font-semibold ${ppm ? "text-emerald-700" : "text-amber-700"}`}>{ppm ? `Scale ${ppm.toFixed(2)} px/m` : "Calibrate before measuring"}</span><span>{edges.length} lines</span><span>{loops.length} closed {loops.length === 1 ? "area" : "areas"}</span><strong className="rounded-lg bg-emerald-100 px-2.5 py-1 text-emerald-800">Total {formatArea(totalArea)}</strong><select aria-label="Display units" className="rounded-lg border border-slate-200 bg-white px-2 py-1" value={units} onChange={(event) => actions.setUnits(event.target.value as Units)}><option value="m">meters</option><option value="cm">centimeters</option><option value="mm">millimeters</option></select><span className="ml-auto hidden text-slate-500 xl:inline">Click to draw · click a point to connect · drag to move · double-click to remove · Enter to finish · Space-drag to pan</span></section>
+    <div ref={containerRef} className="relative min-h-0 flex-1 overflow-hidden bg-slate-200" onDrop={(event) => { event.preventDefault(); const file = event.dataTransfer.files[0]; if (file) void onFile(file); }} onDragOver={(event) => event.preventDefault()}>
+      {!imageInfo && <div className="pointer-events-none absolute inset-0 z-10 grid place-items-center"><div className="rounded-2xl border border-slate-200 bg-white/90 px-8 py-6 text-center shadow-xl backdrop-blur"><h1 className="text-xl font-bold">Open or drop a floor plan</h1><p className="mt-2 text-sm text-slate-500">Images and PDFs supported. PDFs open on their first page, then calibrate a known distance to trace rooms.</p>{fileError && <p className="mt-3 text-sm font-medium text-rose-600">{fileError}</p>}</div></div>}
+      {imageInfo && fileError && <div className="absolute left-4 top-4 z-10 rounded-lg bg-rose-50 px-3 py-2 text-sm font-medium text-rose-700 shadow">{fileError}</div>}
+      {imageInfo?.kind === "image" && <img src={imageInfo.dataUrl} alt="Floor plan" className="pointer-events-none absolute left-0 top-0 max-w-none origin-top-left" style={{ width: imageInfo.width, height: imageInfo.height, transform: `translate(${view.offset.x}px, ${view.offset.y}px) scale(${view.zoom})` }} />}
+      {imageInfo?.kind === "pdf" && <canvas ref={pdfCanvasRef} className="pointer-events-none absolute left-0 top-0 origin-top-left" />}
+      <canvas ref={canvasRef} className="absolute inset-0 z-[1] block h-full w-full" style={{ cursor, touchAction: "none" }} onPointerDown={onPointerDown} onPointerMove={onPointerMove} onPointerUp={endPointer} onPointerCancel={endPointer} onDoubleClick={(event) => { const id = pointAt(eventScreen(event)); if (id && tool === "draw") actions.removePoint(id, 2); }} onPointerLeave={() => { setPointerWorld(null); setHoveredPointId(null); setHoveredSegment(null); }} onContextMenu={(event) => event.preventDefault()} />
     </div>
-  );
+    <footer className="flex min-h-12 items-center gap-2 overflow-x-auto border-t border-slate-200 bg-white px-4 py-2 text-sm">{loops.length ? loops.map((face, index) => <span key={face.pointIds.join("-")} className="whitespace-nowrap rounded-lg border border-emerald-200 bg-emerald-50 px-2.5 py-1 text-emerald-800">Area {index + 1}: {formatArea(face.areaPx / (ppm! * ppm!))}</span>) : <span className="text-slate-500">Connect lines into an enclosed boundary to calculate its area.</span>}</footer>
+  </main>;
 }

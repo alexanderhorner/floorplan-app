@@ -1,1 +1,9 @@
 @import "tailwindcss";
+
+@layer components {
+  .toolbar-button {
+    @apply rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm font-semibold text-slate-600 shadow-sm hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-35;
+  }
+}
+
+button, input, select { outline-color: #34d399; }
